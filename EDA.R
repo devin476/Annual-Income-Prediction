@@ -1,5 +1,7 @@
 library(tidyverse)
 library(broom)
+library(MASS)
+library(pROC)
 ##Data Prep
 adult <- read.csv("adult.csv")
 
@@ -99,3 +101,110 @@ AIC(m1, m2, m3)
 or_tbl <- tidy(m3, conf.int = TRUE, conf.level = 0.95, exponentiate = TRUE)
 
 or_tbl %>%  arrange(term) %>% print(n = Inf)
+
+
+#objective 2 
+
+#This function is used to compare all competing classifiers using the same validation set
+#Helper function to compute metrics of the predicted probabilities
+get_metrics <- function(truth, prob, threshold = 0.5, positive = ">50K") {
+  # truth: factor vector
+  # prob: numeric probabilities of positive class
+  pred_class <- ifelse(prob >= threshold, positive, setdiff(levels(truth), positive)[1])
+  pred_class <- factor(pred_class, levels = levels(truth))
+  
+  #create confusion matrix
+  tab <- table(Predicted = pred_class, Actual = truth)
+  
+  # confusion matrix cells
+  TP <- tab[positive, positive]
+  TN <- tab[setdiff(levels(truth), positive), 
+            setdiff(levels(truth), positive)]
+  FP <- tab[positive, setdiff(levels(truth), positive)]
+  FN <- tab[setdiff(levels(truth), positive), positive]
+  
+  N  <- sum(tab)
+  
+  #core performance metrics
+  sensitivity <- TP / (TP + FN)
+  specificity <- TN / (TN + FP)
+  ppv         <- TP / (TP + FP)
+  npv         <- TN / (TN + FN)
+  prevalence  <- (TP + FN) / N
+  accuracy    <- (TP + TN) / N
+  
+  #AUROC uses full probability information
+  roc_obj <- roc(response = truth,
+                 predictor = prob,
+                 levels = rev(levels(truth)))  # make sure positive is correct
+  auc_val <- as.numeric(auc(roc_obj))
+  
+  #return a tibble so that the results from different models can be binded later
+  tibble(
+    threshold  = threshold,
+    accuracy   = accuracy,
+    sensitivity = sensitivity,
+    specificity = specificity,
+    PPV        = ppv,
+    NPV        = npv,
+    prevalence = prevalence,
+    AUROC      = auc_val
+  )
+}
+
+#Simple logistic baseline model metrics
+logistic_simple <- glm(income ~ age + education.num + hours.per.week, data = adult_train, family = binomial)
+
+summary(logistic_simple)
+
+#validation set probabilities
+valid_prob_logistic_simple <- predict(logistic_simple, newdata = adult_test, type = "response")
+
+#compute classification metrics for the baseline simple logistic model on test set
+metrics_logit_simple <- get_metrics(adult_test$income, valid_prob_logistic_simple, threshold = 0.5)
+metrics_logit_simple$Model <- "Logit: Simple"
+metrics_logit_simple
+
+#Comlex logistic model metrics
+logistic_complex <- glm(income ~ age + I(age^2) + education.num + hours.per.week + marital.status + sex + capital.gain + capital.loss +
+                          age:hours.per.week, data = adult_train, family = binomial)
+summary(logistic_complex)
+
+#validation set probabilities
+valid_prob_logistic_complex <- predict(logistic_complex, newdata = adult_test, type= "response")
+
+#compute classification metrics for the baseline complex logistic model on test set
+metrics_logit_complex <- get_metrics(adult_test$income, valid_prob_logistic_complex, threshold = 0.5)
+metrics_logit_complex$Model <- "Logit: Complex"
+metrics_logit_complex
+
+#LDA and QDA model metrics
+# Make sure character predictors are factors
+adult_train <- adult_train %>% mutate(across(where(is.character), as.factor))
+adult_test <- adult_test %>% mutate(across(where(is.character), as.factor))
+
+# LDA
+lda_fit <- lda( income ~ age + education.num + hours.per.week +  marital.status + sex + capital.gain + capital.loss,
+  data = adult_train)
+
+
+lda_pred <- predict(lda_fit, newdata = adult_test)
+valid_prob_lda <- lda_pred$posterior[, ">50K"]
+
+#compute classification metrics for the LDA logistic model on test set
+metrics_lda <- get_metrics(adult_test$income, valid_prob_lda, threshold = 0.5)
+metrics_lda$Model <- "LDA"
+metrics_lda
+
+# QDA
+qda_fit <- qda(income ~ age + education.num + hours.per.week + marital.status + sex + capital.gain + capital.loss,
+  data = adult_train)
+
+
+qda_pred <- predict(qda_fit, newdata = adult_test)
+valid_prob_qda <- qda_pred$posterior[, ">50K"]
+
+#compute classification metrics for the QDA logistic model on test set
+metrics_qda <- get_metrics(adult_test$income, valid_prob_qda, threshold = 0.5)
+metrics_qda$Model <- "QDA"
+metrics_qda
