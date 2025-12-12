@@ -2,6 +2,9 @@ library(tidyverse)
 library(broom)
 library(MASS)
 library(pROC)
+library(randomForest)
+library(caret)
+library(reshape2)
 ##Data Prep
 adult <- read.csv("adult.csv")
 
@@ -208,3 +211,110 @@ valid_prob_qda <- qda_pred$posterior[, ">50K"]
 metrics_qda <- get_metrics(adult_test$income, valid_prob_qda, threshold = 0.5)
 metrics_qda$Model <- "QDA"
 metrics_qda
+
+#random forest model
+set.seed(123)
+rf_fit <- randomForest(income ~ age + education.num + hours.per.week + marital.status +
+                         sex + capital.gain + capital.loss, data = adult_train,
+                       ntree = 500, importance = TRUE)
+
+#validation set probabilities
+rf_pred <- predict(rf_fit, newdata = adult_test, type = "prob")
+valid_prob_rf <- rf_pred[, ">50K"]
+
+#compute classification metrics for random forest model on test set
+metrics_rf <- get_metrics(adult_test$income, valid_prob_rf, threshold = 0.5)
+metrics_rf$Model <- "Random Forest"
+metrics_rf
+
+#variable importance plot
+varImpPlot(rf_fit, main = "RF Variable Importance")
+
+##model comparison
+
+#consolidated metrics table
+all_metrics <- bind_rows(
+  metrics_logit_simple,
+  metrics_logit_complex,
+  metrics_lda,
+  metrics_qda,
+  metrics_rf)
+
+all_metrics <- all_metrics %>%
+  dplyr::select(Model, threshold, accuracy, sensitivity, specificity, PPV, NPV, prevalence, AUROC)
+
+all_metrics
+
+#roc curves for all models
+roc_logit_simple <- roc(adult_test$income, valid_prob_logistic_simple, levels = rev(levels(adult_test$income)))
+roc_logit_complex <- roc(adult_test$income, valid_prob_logistic_complex, levels = rev(levels(adult_test$income)))
+roc_lda <- roc(adult_test$income, valid_prob_lda, levels = rev(levels(adult_test$income)))
+roc_qda <- roc(adult_test$income, valid_prob_qda, levels = rev(levels(adult_test$income)))
+roc_rf <- roc(adult_test$income, valid_prob_rf, levels = rev(levels(adult_test$income)))
+
+#plot roc curves
+plot(roc_logit_simple, col = "blue", lwd = 2, main = "ROC Comparison")
+plot(roc_logit_complex, col = "red", lwd = 2, add = TRUE)
+plot(roc_lda, col = "green", lwd = 2, add = TRUE)
+plot(roc_qda, col = "purple", lwd = 2, add = TRUE)
+plot(roc_rf, col = "orange", lwd = 2, add = TRUE)
+legend("bottomright",
+       legend = c(paste("Logit Simple (AUC =", round(auc(roc_logit_simple), 3), ")"),
+                  paste("Logit Complex (AUC =", round(auc(roc_logit_complex), 3), ")"),
+                  paste("LDA (AUC =", round(auc(roc_lda), 3), ")"),
+                  paste("QDA (AUC =", round(auc(roc_qda), 3), ")"),
+                  paste("Random Forest (AUC =", round(auc(roc_rf), 3), ")")),
+       col = c("blue", "red", "green", "purple", "orange"),
+       lwd = 2, cex = 0.7)
+
+##pca analysis
+
+#pca on numeric predictors
+numeric_vars <- adult_train %>%
+  dplyr::select(age, fnlwgt, education.num, capital.gain, capital.loss, hours.per.week)
+
+pca_result <- prcomp(numeric_vars, scale. = TRUE, center = TRUE)
+
+summary(pca_result)
+
+#scree plot
+pca_var <- pca_result$sdev^2
+pca_var_prop <- pca_var / sum(pca_var)
+
+scree_data <- data.frame(
+  PC = 1:length(pca_var_prop),
+  Variance = pca_var_prop,
+  Cumulative = cumsum(pca_var_prop))
+
+ggplot(scree_data, aes(x = PC, y = Variance)) +
+  geom_bar(stat = "identity", fill = "blue", alpha = 0.7) +
+  geom_line(aes(y = Cumulative), color = "red", linewidth = 1) +
+  geom_point(aes(y = Cumulative), color = "red", size = 3) +
+  labs(title = "PCA Scree Plot", x = "Principal", y = "Proportion of Variance")
+
+#biplot of first two principal components
+biplot_data <- data.frame(
+  PC1 = pca_result$x[, 1],
+  PC2 = pca_result$x[, 2],
+  income = adult_train$income)
+
+ggplot(biplot_data, aes(x = PC1, y = PC2, color = income)) +
+  geom_point(alpha = 0.3) +
+  labs(title = "PCA Biplot: PC1 vs PC2", x = "PC1", y = "PC2", color = "Income")
+
+#pca loadings
+pca_loadings <- pca_result$rotation[, 1:3]
+pca_loadings
+
+#correlation heatmap
+cor_matrix <- adult_train %>%
+  dplyr::select(age, education.num, hours.per.week, capital.gain, capital.loss) %>%
+  cor(use = "complete.obs")
+
+melted_cor <- melt(cor_matrix)
+
+ggplot(melted_cor, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(value, 2)), color = "black", size = 3) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Correlation Heatmap", x = "", y = "", fill = "Correlation")
