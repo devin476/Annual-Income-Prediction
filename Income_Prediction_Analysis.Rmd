@@ -1,0 +1,550 @@
+---
+title: "Annual Income Prediction Analysis"
+author: "Titus Karuri, Drew Nunnaly, Devin Streeter"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Executive Summary
+
+This analysis explores the Adult Income dataset to predict whether an individual's annual income exceeds $50K. We employ multiple statistical and machine learning techniques including logistic regression, Linear Discriminant Analysis (LDA), Quadratic Discriminant Analysis (QDA), and Random Forests. The analysis includes exploratory data analysis, model building, performance comparison, and dimensionality reduction via PCA.
+
+# 1. Data Preparation
+
+## 1.1 Required Libraries
+
+```{r libraries}
+library(tidyverse)
+library(broom)
+library(MASS)
+library(pROC)
+library(randomForest)
+library(caret)
+library(reshape2)
+```
+
+## 1.2 Load and Prepare Data
+
+```{r data_prep}
+##Data Prep
+adult <- read.csv("adult.csv")
+
+summary(adult)
+
+# Make outcome a factor with "<=50K" as reference level
+adult <- adult %>% mutate(income = str_trim(income), income = factor(income, levels = c("<=50K", ">50K")))
+
+set.seed(123)
+n <- nrow(adult)
+train_idx <- sample(1:n, size = floor(0.7 * n))
+adult_train <- adult[train_idx, ]
+adult_test <- adult[-train_idx, ]
+```
+
+We set "<=50K" as the reference level for our binary outcome variable, which means model coefficients will represent the log-odds of earning more than $50K. The 70/30 train-test split provides sufficient data for model training while reserving adequate samples for validation.
+
+# 2. Exploratory Data Analysis
+
+## 2.1 Income Distribution
+
+```{r income_distribution}
+##EDA
+#output table with count and proportions of each income class
+adult_train %>% count(income) %>% mutate(prop = n/sum(n))
+```
+
+ The dataset exhibits class imbalance, with the majority of individuals earning <=50K. This imbalance should be considered when evaluating model performance, as accuracy alone may be misleading.
+
+## 2.2 Numeric Variable Distributions
+
+### 2.2.1 Summary Statistics with Skewness
+
+```{r numeric_summary}
+#summaries w/ skew
+adult_train %>%
+  dplyr::select(age, fnlwgt, education.num, capital.gain, capital.loss, hours.per.week) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  group_by(variable) %>%
+  summarise(mean = mean(value), median = median(value), sd = sd(value), IQR = IQR(value),
+            skewness = (mean - median) / sd, .groups = "drop")
+```
+
+ Capital gain and capital loss show extreme right skewness (mean >> median), indicating most individuals have zero or minimal values with a few high earners. Age and hours per week appear more normally distributed. Education years show slight positive skewness.
+
+### 2.2.2 Distribution Plots
+
+```{r distribution_plots}
+#distribution plots
+adult_train %>%
+  dplyr::select(age, education.num, hours.per.week, capital.gain) %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30, fill = "blue", alpha = 0.7) +
+  geom_density(color = "red", linewidth = 1) +
+  facet_wrap(~name, scales = "free", ncol = 2) +
+  labs(title = "Distribution of Numeric Predictors")
+```
+
+ The visual distributions confirm our numerical findings. Capital gain is heavily zero-inflated, age shows a slight right skew with mode around 35-40, education follows an approximately normal distribution centered around 10 years, and hours per week peaks around 40 (full-time).
+
+## 2.3 Relationship Between Predictors and Income
+
+### 2.3.1 Age vs Income
+
+```{r age_income}
+#age vs income
+adult_train %>%
+  ggplot(aes(x = income, y = age, fill = income)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_violin(alpha = 0.3) +
+  labs(title = "Age Distribution x Income Class", y = "Age", x = "Income")
+
+#ttest for age difference
+t.test(age ~ income, data = adult_train)
+```
+
+ Individuals earning >50K tend to be older (median ~44 vs ~35 years). The t-test confirms this difference is highly statistically significant (p < 0.001), suggesting age is an important predictor. The violin plot reveals that the >50K group has a more uniform age distribution across middle ages, while the <=50K group skews younger.
+
+### 2.3.2 Education vs Income
+
+```{r education_income}
+#education plot
+adult_train %>%
+  ggplot(aes(x = income, y = education.num, fill = income)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Education x Income Class", y = "Years", x = "Income Class")
+```
+
+ Higher earners have significantly more education (median ~12 vs ~9 years). This roughly corresponds to college education vs high school, highlighting education as a critical income predictor.
+
+### 2.3.3 Hours Worked vs Income
+
+```{r hours_income}
+adult_train %>% ggplot(aes(x = income, y = hours.per.week)) +
+  geom_boxplot() + labs(title = "Hours per week vs Income")
+```
+
+ Higher earners work slightly more hours on average, though the difference is less pronounced than for age or education. Both groups cluster around 40 hours/week (full-time).
+
+### 2.3.4 Age and Education Interaction
+
+```{r age_education_interaction, warning=FALSE}
+#age, education, income
+adult_train %>%
+  ggplot(aes(x = age, y = education.num, color = income)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "loess") +
+  labs(title = "Age vs Education x Income", x = "Age", y = "Education", color = "Income")
+```
+
+ The separation between income groups is visible across most age ranges, with higher education levels associated with >50K income. The gap is most pronounced in middle age (30-50), where the combination of experience and education maximizes earning potential.
+
+## 2.4 Correlation Analysis
+
+```{r correlation_matrix}
+#correlation matrix
+adult_train %>%
+  dplyr::select(age, education.num, hours.per.week, capital.gain, capital.loss) %>%
+  cor(use = "complete.obs")
+```
+
+
+```{r correlation_heatmap}
+#correlation heatmap
+cor_matrix <- adult_train %>%
+  dplyr::select(age, education.num, hours.per.week, capital.gain, capital.loss) %>%
+  cor(use = "complete.obs")
+
+melted_cor <- melt(cor_matrix)
+
+ggplot(melted_cor, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(value, 2)), color = "black", size = 3) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Correlation Heatmap", x = "", y = "", fill = "Correlation")
+```
+
+ Correlations among predictors are generally weak. The strongest correlation is between education and hours per week (0.142), which is still weak. Age and education show negligible correlation (0.039). Capital gain and capital loss show very weak correlations with other variables, suggesting they capture unique information. The lack of strong multicollinearity is favorable for regression modeling.
+
+# 3. Model Development
+
+## 3.1 Initial Model Comparison
+
+We begin by fitting three logistic regression models of increasing complexity to understand which predictors add value.
+
+```{r initial_models}
+##Models
+# Model 1: simple baseline with a few key predictors
+m1 <- glm(income ~ age + education.num + hours.per.week,
+          data = adult_train,
+          family = binomial)
+
+# Model 2: add marital status and sex
+m2 <- glm(income ~ age + education.num + hours.per.week +
+            marital.status + sex,
+          data = adult_train,
+          family = binomial)
+
+# Model 3: richer model with some additional strong predictors
+m3 <- glm(income ~ age + education.num + hours.per.week +
+            marital.status + sex +
+            capital.gain + capital.loss,
+          data = adult_train,
+          family = binomial)
+
+# Compare AICs
+AIC(m1, m2, m3)
+#m3 perfroms the best
+```
+
+ Model 3 achieves the lowest AIC, indicating superior fit when accounting for model complexity. The substantial AIC reduction from m1 to m2 (adding marital status and sex) and from m2 to m3 (adding capital variables) suggests these predictors provide meaningful predictive power.
+
+## 3.2 Best Model Interpretation
+
+```{r best_model_interpretation}
+#odds ratio
+or_tbl <- tidy(m3, conf.int = TRUE, conf.level = 0.95, exponentiate = TRUE)
+
+or_tbl %>%  arrange(term) %>% print(n = Inf)
+```
+
+**Key Odds Ratios:**
+
+- **Age:** Each additional year increases odds of earning >50K by approximately the factor shown
+- **Education:** Each additional year of education substantially increases income odds
+- **Hours per week:** More work hours associate with higher income
+- **Marital status:** Married individuals (particularly married-civ-spouse) have dramatically higher odds of earning >50K
+- **Sex:** Significant disparity exists between male and female income odds
+- **Capital gain/loss:** Strong positive associations, though these variables are zero-inflated
+
+# 4. Model Performance Evaluation
+
+## 4.1 Evaluation Metrics Function
+
+```{r metrics_function}
+#objective 2
+
+#This function is used to compare all competing classifiers using the same validation set
+#Helper function to compute metrics of the predicted probabilities
+get_metrics <- function(truth, prob, threshold = 0.5, positive = ">50K") {
+  # truth: factor vector
+  # prob: numeric probabilities of positive class
+  pred_class <- ifelse(prob >= threshold, positive, setdiff(levels(truth), positive)[1])
+  pred_class <- factor(pred_class, levels = levels(truth))
+
+  #create confusion matrix
+  tab <- table(Predicted = pred_class, Actual = truth)
+
+  # confusion matrix cells
+  TP <- tab[positive, positive]
+  TN <- tab[setdiff(levels(truth), positive),
+            setdiff(levels(truth), positive)]
+  FP <- tab[positive, setdiff(levels(truth), positive)]
+  FN <- tab[setdiff(levels(truth), positive), positive]
+
+  N  <- sum(tab)
+
+  #core performance metrics
+  sensitivity <- TP / (TP + FN)
+  specificity <- TN / (TN + FP)
+  ppv         <- TP / (TP + FP)
+  npv         <- TN / (TN + FN)
+  prevalence  <- (TP + FN) / N
+  accuracy    <- (TP + TN) / N
+
+  #AUROC uses full probability information
+  roc_obj <- roc(response = truth,
+                 predictor = prob,
+                 levels = rev(levels(truth)))  # make sure positive is correct
+  auc_val <- as.numeric(auc(roc_obj))
+
+  #return a tibble so that the results from different models can be binded later
+  tibble(
+    threshold  = threshold,
+    accuracy   = accuracy,
+    sensitivity = sensitivity,
+    specificity = specificity,
+    PPV        = ppv,
+    NPV        = npv,
+    prevalence = prevalence,
+    AUROC      = auc_val
+  )
+}
+```
+
+## 4.2 Logistic Regression Models
+
+### 4.2.1 Simple Logistic Model
+
+```{r logistic_simple}
+#Simple logistic baseline model metrics
+logistic_simple <- glm(income ~ age + education.num + hours.per.week, data = adult_train, family = binomial)
+
+summary(logistic_simple)
+
+#validation set probabilities
+valid_prob_logistic_simple <- predict(logistic_simple, newdata = adult_test, type = "response")
+
+#compute classification metrics for the baseline simple logistic model on test set
+metrics_logit_simple <- get_metrics(adult_test$income, valid_prob_logistic_simple, threshold = 0.5)
+metrics_logit_simple$Model <- "Logistic: Simple"
+metrics_logit_simple
+```
+
+ The simple model with only age, education, and hours per week achieves reasonable baseline performance. All three predictors are highly significant.
+
+### 4.2.2 Complex Logistic Model
+
+```{r logistic_complex}
+#Comlex logistic model metrics
+logistic_complex <- glm(income ~ age + I(age^2) + education.num + hours.per.week + marital.status + sex + capital.gain + capital.loss +
+                          age:hours.per.week, data = adult_train, family = binomial)
+summary(logistic_complex)
+
+#validation set probabilities
+valid_prob_logistic_complex <- predict(logistic_complex, newdata = adult_test, type= "response")
+
+#compute classification metrics for the baseline complex logistic model on test set
+metrics_logit_complex <- get_metrics(adult_test$income, valid_prob_logistic_complex, threshold = 0.5)
+metrics_logit_complex$Model <- "Logistic: Complex"
+metrics_logit_complex
+```
+
+ The complex model adds a quadratic age term and age-hours interaction to capture non-linear relationships. The age-squared term tests whether the effect of age on income plateaus or reverses at older ages. Performance metrics show improvement over the simple model.
+
+## 4.3 Discriminant Analysis Models
+
+```{r prepare_factors}
+#LDA and QDA model metrics
+# Make sure character predictors are factors
+adult_train <- adult_train %>% mutate(across(where(is.character), as.factor))
+adult_test <- adult_test %>% mutate(across(where(is.character), as.factor))
+```
+
+### 4.3.1 Linear Discriminant Analysis (LDA)
+
+```{r lda_model}
+# LDA
+lda_fit <- lda( income ~ age + education.num + hours.per.week +  marital.status + sex + capital.gain + capital.loss,
+  data = adult_train)
+
+
+lda_pred <- predict(lda_fit, newdata = adult_test)
+valid_prob_lda <- lda_pred$posterior[, ">50K"]
+
+#compute classification metrics for the LDA logistic model on test set
+metrics_lda <- get_metrics(adult_test$income, valid_prob_lda, threshold = 0.5)
+metrics_lda$Model <- "LDA"
+metrics_lda
+```
+
+ LDA assumes predictors follow a multivariate normal distribution within each class with equal covariance matrices. This assumption may be violated given the skewed distributions of capital variables, but LDA often performs well despite modest violations.
+
+### 4.3.2 Quadratic Discriminant Analysis (QDA)
+
+```{r qda_model}
+# QDA
+qda_fit <- qda(income ~ age + education.num + hours.per.week + marital.status + sex + capital.gain + capital.loss,
+  data = adult_train)
+
+
+qda_pred <- predict(qda_fit, newdata = adult_test)
+valid_prob_qda <- qda_pred$posterior[, ">50K"]
+
+#compute classification metrics for the QDA logistic model on test set
+metrics_qda <- get_metrics(adult_test$income, valid_prob_qda, threshold = 0.5)
+metrics_qda$Model <- "QDA"
+metrics_qda
+```
+
+ QDA relaxes LDA's equal covariance assumption, allowing each class to have its own covariance structure. This flexibility can capture more complex decision boundaries but requires estimating more parameters, potentially leading to higher variance.
+
+## 4.4 Random Forest
+
+```{r random_forest}
+#random forest model
+set.seed(123)
+rf_fit <- randomForest(income ~ age + education.num + hours.per.week + marital.status +
+                         sex + capital.gain + capital.loss, data = adult_train,
+                       ntree = 500, importance = TRUE)
+
+#validation set probabilities
+rf_pred <- predict(rf_fit, newdata = adult_test, type = "prob")
+valid_prob_rf <- rf_pred[, ">50K"]
+
+#compute classification metrics for random forest model on test set
+metrics_rf <- get_metrics(adult_test$income, valid_prob_rf, threshold = 0.5)
+metrics_rf$Model <- "Random Forest"
+metrics_rf
+```
+
+
+### 4.4.1 Variable Importance
+
+```{r variable_importance}
+#variable importance plot
+varImpPlot(rf_fit, main = "RF Variable Importance")
+```
+
+ The variable importance plot reveals which features most reduce prediction error. Capital gain, marital status, and age appear as top predictors, confirming findings from our exploratory analysis and logistic regression.
+
+# 5. Model Comparison
+
+## 5.1 Consolidated Metrics Table
+
+```{r model_comparison_table}
+##model comparison
+
+#consolidated metrics table
+all_metrics <- bind_rows(
+  metrics_logit_simple,
+  metrics_logit_complex,
+  metrics_lda,
+  metrics_qda,
+  metrics_rf)
+
+all_metrics <- all_metrics %>%
+  dplyr::select(Model, threshold, accuracy, sensitivity, specificity, PPV, NPV, prevalence, AUROC)
+
+all_metrics
+```
+
+
+
+- **Accuracy:** Overall correct classification rate; higher is better
+- **Sensitivity (Recall):** Proportion of actual >50K correctly identified; crucial if we want to capture high earners
+- **Specificity:** Proportion of actual <=50K correctly identified; important for avoiding false alarms
+- **PPV (Precision):** When we predict >50K, how often are we right?
+- **NPV:** When we predict <=50K, how often are we right?
+- **AUROC:** Overall discriminative ability across all thresholds; closer to 1.0 is better
+
+The model with the highest AUROC demonstrates the best overall discriminative performance.
+
+## 5.2 ROC Curve Comparison
+
+```{r roc_comparison}
+#roc curves for all models
+roc_logit_simple <- roc(adult_test$income, valid_prob_logistic_simple, levels = rev(levels(adult_test$income)))
+roc_logit_complex <- roc(adult_test$income, valid_prob_logistic_complex, levels = rev(levels(adult_test$income)))
+roc_lda <- roc(adult_test$income, valid_prob_lda, levels = rev(levels(adult_test$income)))
+roc_qda <- roc(adult_test$income, valid_prob_qda, levels = rev(levels(adult_test$income)))
+roc_rf <- roc(adult_test$income, valid_prob_rf, levels = rev(levels(adult_test$income)))
+
+#plot roc curves
+plot(roc_logit_simple, col = "blue", lwd = 2, main = "ROC Comparison")
+plot(roc_logit_complex, col = "red", lwd = 2, add = TRUE)
+plot(roc_lda, col = "green", lwd = 2, add = TRUE)
+plot(roc_qda, col = "purple", lwd = 2, add = TRUE)
+plot(roc_rf, col = "orange", lwd = 2, add = TRUE)
+legend("bottomright",
+       legend = c(paste("Logistic Simple (AUC =", round(auc(roc_logit_simple), 3), ")"),
+                  paste("Logistic Complex (AUC =", round(auc(roc_logit_complex), 3), ")"),
+                  paste("LDA (AUC =", round(auc(roc_lda), 3), ")"),
+                  paste("QDA (AUC =", round(auc(roc_qda), 3), ")"),
+                  paste("Random Forest (AUC =", round(auc(roc_rf), 3), ")")),
+       col = c("blue", "red", "green", "purple", "orange"),
+       lwd = 2, cex = 0.7)
+```
+
+ ROC curves plot sensitivity (True Positive Rate) against 1-specificity (False Positive Rate) across all classification thresholds. Curves closer to the top-left corner indicate better performance. The AUC (Area Under the Curve) provides a single-number summary: 1.0 is perfect, 0.5 is random guessing. Models with overlapping ROC curves have similar discriminative ability.
+
+# 6. Dimensionality Reduction: PCA
+
+## 6.1 Principal Components Analysis
+
+```{r pca_analysis}
+#pca on numeric predictors
+numeric_vars <- adult_train %>%
+  dplyr::select(age, fnlwgt, education.num, capital.gain, capital.loss, hours.per.week)
+
+pca_result <- prcomp(numeric_vars, scale. = TRUE, center = TRUE)
+
+summary(pca_result)
+```
+
+ We standardize variables (scale=TRUE, center=TRUE) because they're measured on different scales. The summary shows how much variance each principal component explains. The first few PCs capture most of the variation, potentially allowing dimension reduction while retaining information.
+
+## 6.2 Scree Plot
+
+```{r scree_plot}
+#scree plot
+pca_var <- pca_result$sdev^2
+pca_var_prop <- pca_var / sum(pca_var)
+
+scree_data <- data.frame(
+  PC = 1:length(pca_var_prop),
+  Variance = pca_var_prop,
+  Cumulative = cumsum(pca_var_prop))
+
+ggplot(scree_data, aes(x = PC, y = Variance)) +
+  geom_bar(stat = "identity", fill = "blue", alpha = 0.7) +
+  geom_line(aes(y = Cumulative), color = "red", linewidth = 1) +
+  geom_point(aes(y = Cumulative), color = "red", size = 3) +
+  labs(title = "PCA Scree Plot", x = "Principal", y = "Proportion of Variance")
+```
+
+ The scree plot helps determine how many PCs to retain. Look for an "elbow" where additional components add little variance. The cumulative variance line (red) shows that the first 3-4 components capture the majority of variation.
+
+## 6.3 PCA Biplot
+
+```{r pca_biplot}
+#biplot of first two principal components
+biplot_data <- data.frame(
+  PC1 = pca_result$x[, 1],
+  PC2 = pca_result$x[, 2],
+  income = adult_train$income)
+
+ggplot(biplot_data, aes(x = PC1, y = PC2, color = income)) +
+  geom_point(alpha = 0.3) +
+  labs(title = "PCA Biplot: PC1 vs PC2", x = "PC1", y = "PC2", color = "Income")
+```
+
+ The biplot projects observations onto the first two principal components. Some separation between income classes is visible, though substantial overlap exists. This suggests that income prediction requires multiple dimensions and cannot be fully captured by just two linear combinations of numeric predictors.
+
+## 6.4 PCA Loadings
+
+```{r pca_loadings}
+#pca loadings
+pca_loadings <- pca_result$rotation[, 1:3]
+pca_loadings
+```
+
+ Loadings show how original variables contribute to each PC. Large absolute loadings indicate variables that strongly influence that component.
+
+- **PC1:** Dominated by education (0.547) and hours worked (0.507), with moderate contributions from capital gain (0.427) and age (0.393), representing a work/human capital dimension
+- **PC2:** Dominated by fnlwgt (0.562) and capital variables (capital gain: 0.494, capital loss: -0.510), representing sampling weight and investment wealth
+- **PC3:** Dominated by capital loss (-0.641) and fnlwgt (-0.501), with age (0.364) and capital gain (0.322) contributing, capturing additional wealth-related variation
+
+# 7. Conclusions and Recommendations
+
+## 7.1 Key Findings
+
+1. **Significant Predictors:** Age, education, marital status, capital gain/loss, and sex all show strong associations with income >50K
+
+2. **Model Performance:** All models achieve similar performance, with AUROC values clustered together. Random Forest and complex logistic regression show marginal advantages in some metrics
+
+3. **Class Imbalance:** The dataset is imbalanced (~75% earning <=50K), which affects interpretation of accuracy metrics. Sensitivity and specificity provide more nuanced assessment
+
+4. **Non-linearity:** The modest improvement of Random Forest over logistic regression suggests relationships may be somewhat non-linear, though not dramatically so
+
+## 7.2 Model Selection Recommendations
+
+**For maximum predictive accuracy:** Use Random Forest or the complex logistic regression model, depending on interpretability needs
+
+**For interpretability:** Use Model 3 logistic regression, which provides clear odds ratios while maintaining good performance
+
+**For computational efficiency:** Use the simple logistic model (m1) if modest performance trade-offs are acceptable
+
+## 7.3 Implications
+
+- **Education investment** shows strong returns in income potential
+- **Marital status** is a surprisingly strong predictor, possibly reflecting dual incomes or lifestyle stability
+- **Capital variables** are powerful predictors but zero-inflated, representing a subset of high-wealth individuals
+- **Gender disparity** persists in income prediction, indicating potential systemic inequality
+
+
